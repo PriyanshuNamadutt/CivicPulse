@@ -1,5 +1,4 @@
 const jwt = require('jsonwebtoken');
-const crypto = require('crypto');
 const User = require('../models/User');
 const OTP = require('../models/OTP');
 const { sendOTPEmail } = require('../services/emailService');
@@ -27,19 +26,24 @@ const register = async (req, res) => {
 
     const user = await User.create({ name, email: email.toLowerCase(), password, phoneNumber });
 
-    // Award early adopter badge if user count < 100
+    // Award early adopter badge if user count <= 100
     const userCount = await User.countDocuments();
     if (userCount <= 100) {
-      const badge = { name: 'Early Adopter', description: 'One of the first citizens to join CivicPulse', icon: '🚀', type: 'early_adopter', earnedAt: new Date() };
+      const badge = {
+        name: 'Early Adopter',
+        description: 'One of the first citizens to join CivicPulse',
+        icon: '🚀',
+        type: 'early_adopter',
+        earnedAt: new Date()
+      };
       user.badges.push(badge);
       user.points += 150;
       await user.save();
     }
 
-    // Send email verification OTP
-    const otp = generateOTP();
-    await OTP.create({ email: user.email, otp, purpose: 'email_verification' });
-    await sendOTPEmail(user.email, otp, 'email_verification');
+    // OTP is NOT sent here.
+    // Frontend calls POST /api/auth/send-otp after receiving the token.
+    // This keeps registration atomic and prevents duplicate OTPs.
 
     const token = generateToken(user._id);
 
@@ -120,26 +124,52 @@ const sendOTP = async (req, res) => {
     const { purpose } = req.body;
     const email = req.user?.email || req.body.email;
 
-    if (!email) return res.status(400).json({ success: false, message: 'Email required.' });
+    if (!email)   return res.status(400).json({ success: false, message: 'Email required.' });
+    if (!purpose) return res.status(400).json({ success: false, message: 'Purpose required.' });
 
-    // Rate limit: max 3 OTPs per 15 min
-    const recentOtps = await OTP.countDocuments({
+    // Rate limit: max 5 OTPs per 15 min per email+purpose
+    const recentCount = await OTP.countDocuments({
       email,
       purpose,
       createdAt: { $gte: new Date(Date.now() - 15 * 60 * 1000) }
     });
-
-    if (recentOtps >= 3) {
-      return res.status(429).json({ success: false, message: 'Too many OTP requests. Please wait 15 minutes.' });
+    if (recentCount >= 5) {
+      return res.status(429).json({
+        success: false,
+        message: 'Too many OTP requests. Please wait 15 minutes before trying again.'
+      });
     }
 
-    const otp = generateOTP();
-    await OTP.create({ email, otp, purpose });
-    await sendOTPEmail(email, otp, purpose);
+    // Invalidate all previous unused OTPs for this email+purpose
+    // so only the latest one ever works — prevents confusion
+    await OTP.updateMany(
+      { email, purpose, isUsed: false },
+      { $set: { isUsed: true } }
+    );
 
-    res.json({ success: true, message: 'OTP sent to your email.' });
+    // Generate new OTP
+    const otp = generateOTP();
+    console.log(`[OTP] Sending ${purpose} OTP to ${email}`);
+
+    // Send email FIRST — only save to DB if SMTP succeeds
+    try {
+      await sendOTPEmail(email, otp, purpose);
+    } catch (emailErr) {
+      console.error('[OTP] SMTP failure:', emailErr.message);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to send OTP email. Please check your email address and try again.',
+        detail: process.env.NODE_ENV === 'development' ? emailErr.message : undefined
+      });
+    }
+
+    // Persist only after confirmed sent
+    await OTP.create({ email, otp, purpose });
+    console.log(`[OTP] Saved to DB for ${email} (${purpose})`);
+
+    res.json({ success: true, message: `OTP sent to ${email}` });
   } catch (error) {
-    console.error('Send OTP error:', error);
+    console.error('[OTP] sendOTP error:', error);
     res.status(500).json({ success: false, message: 'Failed to send OTP.' });
   }
 };
