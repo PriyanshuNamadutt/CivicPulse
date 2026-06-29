@@ -67,9 +67,17 @@ const issueSchema = new mongoose.Schema({
   }],
   // Authority
   assignedAuthority: {
-    name: String,
-    email: { type: String, required: true },
-    department: String
+    name:            String,
+    email:           { type: String, required: true },
+    department:      String,
+    phone:           String,
+    jurisdiction:    String,
+    website:         String,
+    grievancePortal: String,
+    emailSource:     String,   // 'ai-web-search' | 'admin-fallback' | 'static' | 'none'
+    source:          String,   // 'ai-web-search' | 'static'
+    groundingSources:[String], // web URLs Gemini used to find the contact
+    notes:           String
   },
   authorityEmailThreadId: String, // email Message-ID for threading
   // Status tracking
