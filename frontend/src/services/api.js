@@ -45,10 +45,6 @@ export const issueAPI = {
   report: (formData) => api.post('/issues', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
-  checkDuplicate: (data) => api.post('/issues/check-duplicate', data),
-  analyzeMedia: (formData) => api.post('/issues/analyze-media', formData, {
-    headers: { 'Content-Type': 'multipart/form-data' }
-  }),
   upvote: (issueId) => api.post(`/issues/${issueId}/upvote`),
   getStats: () => api.get('/issues/stats/summary'),
 };
