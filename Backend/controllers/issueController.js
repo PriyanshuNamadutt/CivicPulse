@@ -1,104 +1,28 @@
 const Issue = require('../models/Issue');
-const User = require('../models/User');
-const { analyzeIssueMedia, analyzeMediaBuffer } = require('../services/aiService');
+const { analyzeIssueMedia } = require('../services/aiService');
 const { sendIssueToAuthority } = require('../services/emailService');
 const { resolveAuthority } = require('../services/authorityService');
 const { getStaticAuthority } = require('../config/authorities');
 const { awardPoints } = require('../services/gamificationService');
 
-const DUPLICATE_RADIUS = parseInt(process.env.DUPLICATE_RADIUS_METERS) || 100;
+const DUPLICATE_RADIUS = parseInt(process.env.DUPLICATE_RADIUS_METERS) || 50;
 
-// ── POST /api/issues/check-duplicate ──────────────────────────────────────────
-// Duplicate = within DUPLICATE_RADIUS metres AND same assigned department
-const checkDuplicate = async (req, res) => {
-  try {
-    const { latitude, longitude, department } = req.body;
-    if (!latitude || !longitude) {
-      return res.status(400).json({ success: false, message: 'Location required.' });
-    }
-
-    const query = {
-      location: {
-        $near: {
-          $geometry: { type: 'Point', coordinates: [parseFloat(longitude), parseFloat(latitude)] },
-          $maxDistance: DUPLICATE_RADIUS
-        }
-      },
-      status: { $nin: ['resolved', 'rejected'] }
-    };
-
-    // Only filter by department when provided (post-AI-analysis flow)
-    if (department) {
-      query['assignedAuthority.department'] = department;
-    }
-
-    const nearbyIssues = await Issue.find(query)
-      .select('issueId title category status location reportedAt reporterName media upvoteCount assignedAuthority')
-      .limit(5);
-
-    if (nearbyIssues.length > 0) {
-      return res.json({
-        success: true,
-        isDuplicate: true,
-        message: `A similar issue already exists within ${DUPLICATE_RADIUS}m handled by the same department.`,
-        existingIssues: nearbyIssues.map(i => ({
-          issueId: i.issueId,
-          title: i.title,
-          category: i.category,
-          status: i.status,
-          department: i.assignedAuthority?.department,
-          reportedAt: i.reportedAt,
-          upvoteCount: i.upvoteCount,
-          thumbnail: i.media?.[0]?.url
-        }))
-      });
-    }
-    res.json({ success: true, isDuplicate: false });
-  } catch (error) {
-    console.error('checkDuplicate error:', error);
-    res.status(500).json({ success: false, message: 'Server error.' });
-  }
-};
-
-// ── POST /api/issues/analyze-media ───────────────────────────────────────────
-// Returns AI description + category from a raw buffer (no Cloudinary upload yet)
-const analyzeMedia = async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ success: false, message: 'No image file provided.' });
-    }
-
-    const result = await analyzeMediaBuffer(req.file.buffer, req.file.mimetype);
-
-    if (!result.success) {
-      return res.status(422).json({
-        success: false,
-        message: result.error || 'AI analysis failed. Please write a description manually.'
-      });
-    }
-
-    res.json({
-      success: true,
-      description: result.aiDescription,   // primary key read by frontend
-      aiDescription: result.aiDescription, // alias for safety
-      category: result.category,
-      title: result.aiTitle,
-      severity: result.severity,
-      confidence: result.confidence,
-      department: result.department,
-      suggestedAction: result.suggestedAction
-    });
-  } catch (error) {
-    console.error('analyzeMedia error:', error);
-    res.status(500).json({ success: false, message: 'AI analysis failed.' });
-  }
-};
-
-// ── POST /api/issues ──────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/issues
+//
+// Full flow in ONE request:
+//   1. Receive uploaded media (Cloudinary URLs via issueUpload middleware)
+//   2. Receive GPS location (latitude, longitude, address)
+//   3. AI analyzes media → category, title, description, severity
+//   4. AI resolves authority from category + location → name, dept, email, phone
+//   5. Duplicate check: same 50m radius AND same authority.department → reject
+//   6. Create issue, email authority, award points
+// ─────────────────────────────────────────────────────────────────────────────
 const reportIssue = async (req, res) => {
   try {
-    const { description, latitude, longitude, address, ward, city, state, pincode } = req.body;
+    const { latitude, longitude, address, ward, city, state, pincode } = req.body;
 
+    // ── Guards ────────────────────────────────────────────────────────────────
     if (!req.user.aadhaarVerified) {
       return res.status(403).json({
         success: false,
@@ -106,43 +30,44 @@ const reportIssue = async (req, res) => {
         code: 'AADHAAR_REQUIRED'
       });
     }
-    if (!latitude || !longitude) {
-      return res.status(400).json({ success: false, message: 'Location is required.' });
-    }
     if (!req.files || req.files.length === 0) {
       return res.status(400).json({ success: false, message: 'At least one photo or video is required.' });
     }
-    if (!description || description.trim().length < 10) {
-      return res.status(400).json({ success: false, message: 'Description must be at least 10 characters.' });
+    if (!latitude || !longitude) {
+      return res.status(400).json({ success: false, message: 'Location (GPS) is required.' });
     }
 
+    // ── Step 1: Build media array from Cloudinary-uploaded files ─────────────
     const media = req.files.map(file => ({
       url: file.path,
       type: file.mimetype.startsWith('video/') ? 'video' : 'image',
       publicId: file.filename
     }));
 
-    // ── Step 1: AI analysis — category, title, description, severity ──────────
-    const aiResult = await analyzeIssueMedia(media, description);
-    console.log(`[Issue] AI result: category=${aiResult.category} confidence=${aiResult.confidence}`);
+    // ── Step 2: AI analyzes media + location context ──────────────────────────
+    // Passes Cloudinary URLs — AI fetches images and returns:
+    //   category, title, aiDescription, severity, confidence
+    const locationContext = address || `${latitude}, ${longitude}`;
+    const aiResult = await analyzeIssueMedia(media, locationContext);
+    console.log(`[reportIssue] AI → category=${aiResult.category} severity=${aiResult.severity} confidence=${aiResult.confidence}`);
 
-    // ── Step 2: Resolve authority via AI + GPS location ───────────────────────
-    // Nominatim reverse-geocodes the coords → city/district/state.
-    // Gemini then identifies the exact responsible department and official
-    // contact for that specific location and category.
-    // Falls back to static map only if AI call fails.
+    // ── Step 3: AI resolves responsible authority from category + GPS ─────────
+    // Gemini reverse-geocodes coords → real city/district, then identifies
+    // the exact municipal department + official contact for that location.
     const staticFallback = getStaticAuthority(aiResult.category);
     const authority = await resolveAuthority(
       aiResult.category,
-      aiResult.aiDescription || description,
+      aiResult.aiDescription || locationContext,
       parseFloat(latitude),
       parseFloat(longitude),
       staticFallback
     );
-    console.log(`[Issue] Authority resolved via "${authority.source}": ${authority.name} <${authority.email}>`);
+    console.log(`[reportIssue] Authority (${authority.source}): ${authority.name} | ${authority.department} | ${authority.email}`);
 
-    // ── Step 3: Duplicate check — same location + same department ─────────────
-    const nearbyDuplicate = await Issue.findOne({
+    // ── Step 4: Duplicate check — 50m radius + same authority department ──────
+    // If BOTH conditions match → this issue is already filed → tell the user.
+    // If location differs OR authority differs → it's a new issue.
+    const duplicate = await Issue.findOne({
       location: {
         $near: {
           $geometry: { type: 'Point', coordinates: [parseFloat(longitude), parseFloat(latitude)] },
@@ -151,87 +76,139 @@ const reportIssue = async (req, res) => {
       },
       'assignedAuthority.department': authority.department,
       status: { $nin: ['resolved', 'rejected'] }
-    });
+    }).select('issueId title category status assignedAuthority upvoteCount reportedAt media');
 
-    if (nearbyDuplicate) {
+    if (duplicate) {
       return res.status(409).json({
         success: false,
         isDuplicate: true,
-        message: `A ${authority.department} issue already exists near your location. Consider upvoting it instead.`,
+        message: `This issue has already been filed within ${DUPLICATE_RADIUS}m and is assigned to ${authority.department}. You can upvote it to increase priority.`,
         existingIssue: {
-          issueId: nearbyDuplicate.issueId,
-          title: nearbyDuplicate.title,
-          category: nearbyDuplicate.category,
-          status: nearbyDuplicate.status,
-          department: nearbyDuplicate.assignedAuthority?.department
+          issueId:    duplicate.issueId,
+          title:      duplicate.title,
+          category:   duplicate.category,
+          status:     duplicate.status,
+          department: duplicate.assignedAuthority?.department,
+          authority:  duplicate.assignedAuthority?.name,
+          upvoteCount:duplicate.upvoteCount,
+          reportedAt: duplicate.reportedAt,
+          thumbnail:  duplicate.media?.[0]?.url
         }
       });
     }
 
-    // ── Step 4: Create issue ──────────────────────────────────────────────────
+    // ── Step 5: Create issue ──────────────────────────────────────────────────
     const issue = await Issue.create({
-      title: aiResult.aiTitle || description.substring(0, 80),
-      description,
-      category: aiResult.category,
-      aiCategory: aiResult.category,
-      aiDescription: aiResult.aiDescription,
+      title:        aiResult.aiTitle || `${aiResult.category.replace(/_/g, ' ')} reported`,
+      description:  aiResult.aiDescription || locationContext,
+      category:     aiResult.category,
+      aiCategory:   aiResult.category,
+      aiDescription:aiResult.aiDescription,
       aiConfidence: aiResult.confidence,
-      severity: aiResult.severity || 'medium',
+      severity:     aiResult.severity || 'medium',
       reporterName: req.user.name,
-      reporterId: req.user._id,
+      reporterId:   req.user._id,
       location: {
         type: 'Point',
         coordinates: [parseFloat(longitude), parseFloat(latitude)],
-        address: address || 'Location provided',
+        address: address || `${latitude}, ${longitude}`,
         ward, city, state, pincode
       },
       media,
-      assignedAuthority: authority,
+      assignedAuthority: {
+        name:       authority.name,
+        department: authority.department,
+        email:      authority.email,
+        phone:      authority.phone       || '',
+        jurisdiction: authority.jurisdiction || '',
+        source:     authority.source
+      },
       updates: [{
-        message: `Issue reported by ${req.user.name}. AI: ${aiResult.aiDescription || 'Categorized as ' + aiResult.category}. Assigned to ${authority.name} (${authority.source === 'location' ? authority.city || 'location-based' : 'static'} mapping).`,
-        author: 'CivicPulse AI',
+        message: `Issue reported by ${req.user.name}. ` +
+                 `AI detected: "${aiResult.category}" (confidence ${Math.round((aiResult.confidence || 0) * 100)}%). ` +
+                 `Assigned to ${authority.name} via ${authority.source} resolution.`,
+        author:     'CivicPulse AI',
         authorType: 'ai'
       }]
     });
 
-    // ── Step 5: Notify authority by email ─────────────────────────────────────
+    // ── Step 6: Email the authority ───────────────────────────────────────────
     try {
       await sendIssueToAuthority(issue, authority.email);
     } catch (emailErr) {
-      console.error('Authority email failed:', emailErr.message);
-      // Non-fatal — issue is still created
+      console.error('[reportIssue] Email failed (non-fatal):', emailErr.message);
     }
 
-    // ── Step 6: Award gamification points ────────────────────────────────────
+    // ── Step 7: Gamification points ───────────────────────────────────────────
     await awardPoints(req.user._id, 'report_issue');
 
-    res.status(201).json({
+    return res.status(201).json({
       success: true,
       message: 'Issue reported successfully!',
       issue: {
-        issueId: issue.issueId,
-        title: issue.title,
-        category: issue.category,
-        status: issue.status,
-        severity: issue.severity,
-        aiDescription: issue.aiDescription,
-        location: { address: issue.location.address },
+        issueId:      issue.issueId,
+        title:        issue.title,
+        category:     issue.category,
+        status:       issue.status,
+        severity:     issue.severity,
+        aiDescription:issue.aiDescription,
+        location: {
+          address:    issue.location.address,
+          latitude:   issue.location.coordinates[1],
+          longitude:  issue.location.coordinates[0]
+        },
         media: issue.media.map(m => ({ url: m.url, type: m.type })),
         reportedAt: issue.reportedAt,
         assignedAuthority: {
-          name: issue.assignedAuthority.name,
-          department: issue.assignedAuthority.department,
-          source: issue.assignedAuthority.source
+          name:         issue.assignedAuthority.name,
+          department:   issue.assignedAuthority.department,
+          phone:        issue.assignedAuthority.phone,
+          jurisdiction: issue.assignedAuthority.jurisdiction,
+          source:       issue.assignedAuthority.source
+          // email intentionally omitted from response
         }
       }
     });
+
   } catch (error) {
-    console.error('reportIssue error:', error);
-    res.status(500).json({ success: false, message: 'Failed to report issue.' });
+    console.error('[reportIssue] Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to report issue. Please try again.' });
   }
 };
 
-// ── GET /api/issues ───────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/issues/stats/summary
+// ─────────────────────────────────────────────────────────────────────────────
+const getStats = async (req, res) => {
+  try {
+    const [total, resolved, inProgress, reported, categories] = await Promise.all([
+      Issue.countDocuments(),
+      Issue.countDocuments({ status: 'resolved' }),
+      Issue.countDocuments({ status: 'in_progress' }),
+      Issue.countDocuments({ status: 'reported' }),
+      Issue.aggregate([
+        { $group: { _id: '$category', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 8 }
+      ])
+    ]);
+    res.json({
+      success: true,
+      stats: {
+        total, resolved, inProgress, reported,
+        resolutionRate: total > 0 ? Math.round((resolved / total) * 100) : 0
+      },
+      categories
+    });
+  } catch (error) {
+    console.error('[getStats] Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch stats.' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/issues
+// ─────────────────────────────────────────────────────────────────────────────
 const getIssues = async (req, res) => {
   try {
     const {
@@ -240,14 +217,14 @@ const getIssues = async (req, res) => {
     } = req.query;
 
     const query = {};
-    if (status) query.status = status;
+    if (status)   query.status = status;
     if (category) query.category = category;
     if (severity) query.severity = severity;
     if (search) {
       query.$or = [
-        { title: { $regex: search, $options: 'i' } },
+        { title:       { $regex: search, $options: 'i' } },
         { description: { $regex: search, $options: 'i' } },
-        { issueId: { $regex: search, $options: 'i' } }
+        { issueId:     { $regex: search, $options: 'i' } }
       ];
     }
     if (latitude && longitude) {
@@ -263,30 +240,27 @@ const getIssues = async (req, res) => {
     const [issues, total] = await Promise.all([
       Issue.find(query)
         .select('-reporterId -assignedAuthority.email -updates.emailMessageId')
-        .sort(sort)
-        .skip(skip)
-        .limit(parseInt(limit))
-        .lean(),
+        .sort(sort).skip(skip).limit(parseInt(limit)).lean(),
       Issue.countDocuments(query)
     ]);
 
     res.json({
-      success: true,
-      issues,
+      success: true, issues,
       pagination: { page: parseInt(page), limit: parseInt(limit), total, pages: Math.ceil(total / parseInt(limit)) }
     });
   } catch (error) {
-    console.error('getIssues error:', error);
+    console.error('[getIssues] Error:', error);
     res.status(500).json({ success: false, message: 'Failed to fetch issues.' });
   }
 };
 
-// ── GET /api/issues/:issueId ──────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /api/issues/:issueId
+// ─────────────────────────────────────────────────────────────────────────────
 const getIssue = async (req, res) => {
   try {
     const issue = await Issue.findOne({ issueId: req.params.issueId })
-      .select('-assignedAuthority.email -updates.emailMessageId')
-      .lean();
+      .select('-assignedAuthority.email -updates.emailMessageId').lean();
     if (!issue) return res.status(404).json({ success: false, message: 'Issue not found.' });
     res.json({ success: true, issue });
   } catch (error) {
@@ -294,7 +268,9 @@ const getIssue = async (req, res) => {
   }
 };
 
-// ── POST /api/issues/:issueId/upvote ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /api/issues/:issueId/upvote
+// ─────────────────────────────────────────────────────────────────────────────
 const upvoteIssue = async (req, res) => {
   try {
     const issue = await Issue.findOne({ issueId: req.params.issueId });
@@ -312,37 +288,8 @@ const upvoteIssue = async (req, res) => {
     await issue.save();
     res.json({ success: true, upvoted: !hasUpvoted, upvoteCount: issue.upvoteCount });
   } catch (error) {
-    res.status(500).json({ success: false, message: 'Failed to toggle upvote.' });
+    res.status(500).json({ success: false, message: 'Failed to upvote.' });
   }
 };
 
-// ── GET /api/issues/stats/summary ─────────────────────────────────────────────
-const getStats = async (req, res) => {
-  try {
-    const [total, resolved, inProgress, reported, categories] = await Promise.all([
-      Issue.countDocuments(),
-      Issue.countDocuments({ status: 'resolved' }),
-      Issue.countDocuments({ status: 'in_progress' }),
-      Issue.countDocuments({ status: 'reported' }),
-      Issue.aggregate([
-        { $group: { _id: '$category', count: { $sum: 1 } } },
-        { $sort: { count: -1 } },
-        { $limit: 8 }
-      ])
-    ]);
-
-    res.json({
-      success: true,
-      stats: {
-        total, resolved, inProgress, reported,
-        resolutionRate: total > 0 ? Math.round((resolved / total) * 100) : 0
-      },
-      categories
-    });
-  } catch (error) {
-    console.error('getStats error:', error);
-    res.status(500).json({ success: false, message: 'Failed to fetch stats.' });
-  }
-};
-
-module.exports = { reportIssue, getIssues, getIssue, upvoteIssue, getStats, checkDuplicate, analyzeMedia };
+module.exports = { reportIssue, getIssues, getIssue, upvoteIssue, getStats };
