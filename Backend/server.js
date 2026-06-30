@@ -79,20 +79,19 @@ app.get('/api/health', (req, res) => {
 // ─────────────────────────────────────────────────────────────────
 app.get('/api/health/smtp', async (req, res) => {
   try {
-    const nodemailer = require('nodemailer');
-    const transporter = nodemailer.createTransport({
-      host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-      port: parseInt(process.env.EMAIL_PORT) || 587,
-      secure: false,
-      requireTLS: true,
-      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
-      tls: { rejectUnauthorized: true },
-      connectionTimeout: 10000,
-      greetingTimeout: 10000,
-      socketTimeout: 15000
+    const { Resend } = require('resend');
+    if (!process.env.RESEND_API_KEY) {
+      return res.status(500).json({ success: false, error: 'RESEND_API_KEY not set' });
+    }
+    const resend = new Resend(process.env.RESEND_API_KEY);
+    const { data, error } = await resend.emails.send({
+      from: process.env.RESEND_FROM_EMAIL || 'CivicPulse <onboarding@resend.dev>',
+      to: process.env.RESEND_TEST_RECIPIENT || process.env.EMAIL_USER,
+      subject: 'CivicPulse Resend health check',
+      html: '<p>✅ Resend is connected and working.</p>'
     });
-    await transporter.verify();
-    res.json({ success: true, message: 'SMTP connected', host: process.env.EMAIL_HOST });
+    if (error) return res.status(500).json({ success: false, error: error.message });
+    res.json({ success: true, message: 'Resend connected', id: data.id });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
