@@ -42,9 +42,18 @@ export const authAPI = {
 export const issueAPI = {
   getAll: (params) => api.get('/issues', { params }),
   getOne: (issueId) => api.get(`/issues/${issueId}`),
-  report: (formData) => api.post('/issues', formData, {
+
+  // ── Step 1: AI Analysis — media + GPS in, preview out, no DB write ───────
+  analyze: (formData) => api.post('/issues/analyze', formData, {
     headers: { 'Content-Type': 'multipart/form-data' }
   }),
+
+  // ── Step 2: Final submit — plain JSON { analysis: {...} } ────────────────
+  // Renamed from the old single-shot `report` since the flow now requires
+  // calling `analyze` first. `report` is kept as an alias below in case
+  // anything else in the app still references it directly.
+  report: (analysisPayload) => api.post('/issues', analysisPayload),
+
   upvote: (issueId) => api.post(`/issues/${issueId}/upvote`),
   getStats: () => api.get('/issues/stats/summary'),
 };
