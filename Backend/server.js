@@ -7,11 +7,13 @@ const rateLimit = require('express-rate-limit');
 const connectDB = require('./config/database');
 
 // Routes
-const authRoutes = require('./routes/auth');
-const issueRoutes = require('./routes/issues');
-const userRoutes = require('./routes/users');
+const authRoutes   = require('./routes/auth');
+const issueRoutes  = require('./routes/issues');
+const userRoutes   = require('./routes/users');
 
 const app = express();
+
+app.set('trust proxy', 1);
 
 // Connect to MongoDB
 connectDB();
@@ -25,26 +27,27 @@ app.use(cors({
 
 const isDev = process.env.NODE_ENV === 'development';
 
-// General API rate limiter
-// BUG FIX 1: In dev mode, set max to Infinity so no requests are ever blocked.
-// BUG FIX 2: Added `skip` for auth routes so the general limiter does NOT
-//            double-count /api/auth/* requests (it was silently blocking OTP
-//            delivery by consuming the 100-req quota before authLimiter ran).
+// ─────────────────────────────────────────────────────────────────
+// Rate Limiters
+// ─────────────────────────────────────────────────────────────────
+// General limiter — skips /auth/* so authLimiter handles those
+// exclusively (prevents double-counting & false 429s on OTP sends).
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: isDev ? Infinity : 100,
-  skip: (req) => req.path.startsWith('/auth/'), // skip — authLimiter handles these
+  skip: (req) => req.path.startsWith('/auth/'),
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { success: false, message: 'Too many requests, please try again later.' }
 });
 app.use('/api/', limiter);
 
-// Strict limiter for auth routes only
-// BUG FIX 3: Was set to max:10000 (effectively unlimited but inconsistent).
-//            Now clearly Infinity in dev, and a sane 10 in production to
-//            prevent OTP/login brute-force without blocking legitimate sends.
+// Auth-specific limiter — tight in prod to block OTP/login brute-force
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: isDev ? Infinity : 10,
+  standardHeaders: true,
+  legacyHeaders: false,
   message: { success: false, message: 'Too many auth requests. Please wait 15 minutes.' }
 });
 app.use('/api/auth/', authLimiter);
@@ -56,6 +59,8 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 // Logger
 if (isDev) {
   app.use(morgan('dev'));
+} else {
+  app.use(morgan('combined')); // more useful logs in production
 }
 
 // Health check
@@ -63,21 +68,47 @@ app.get('/api/health', (req, res) => {
   res.json({
     success: true,
     message: 'CivicPulse API is running',
+    environment: process.env.NODE_ENV || 'development',
     timestamp: new Date().toISOString()
   });
 });
 
+// ─────────────────────────────────────────────────────────────────
+// SMTP health check — hit this on Render to confirm email works.
+// Remove or guard behind admin auth before going to full production.
+// ─────────────────────────────────────────────────────────────────
+app.get('/api/health/smtp', async (req, res) => {
+  try {
+    const nodemailer = require('nodemailer');
+    const transporter = nodemailer.createTransport({
+      host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.EMAIL_PORT) || 587,
+      secure: false,
+      requireTLS: true,
+      auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS },
+      tls: { rejectUnauthorized: true },
+      connectionTimeout: 10000,
+      greetingTimeout: 10000,
+      socketTimeout: 15000
+    });
+    await transporter.verify();
+    res.json({ success: true, message: 'SMTP connected', host: process.env.EMAIL_HOST });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // API Routes
-app.use('/api/auth', authRoutes);
+app.use('/api/auth',   authRoutes);
 app.use('/api/issues', issueRoutes);
-app.use('/api/users', userRoutes);
+app.use('/api/users',  userRoutes);
 
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ success: false, message: 'Route not found.' });
 });
 
-// Error handler
+// Global error handler
 app.use((err, req, res, next) => {
   console.error(err.stack);
   if (err.code === 'LIMIT_FILE_SIZE') {
@@ -93,7 +124,8 @@ const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   console.log(`🚀 CivicPulse Server running on port ${PORT}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`🔒 Rate limiting: ${isDev ? 'DISABLED (development)' : 'ENABLED (production)'}`);
+  console.log(`🔒 Rate limiting: ${isDev ? 'DISABLED (dev)' : 'ENABLED (prod)'}`);
+  console.log(`🔀 Trust proxy: enabled (Render reverse proxy)`);
 });
 
 // Start email monitoring (IMAP) after server starts
