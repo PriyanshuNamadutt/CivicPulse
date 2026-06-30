@@ -1,39 +1,17 @@
-const nodemailer = require('nodemailer');
+const { Resend } = require('resend');
 
-const transporter = nodemailer.createTransport({
-  host: process.env.EMAIL_HOST || 'smtp.gmail.com',
-  port: parseInt(process.env.EMAIL_PORT) || 587,
-  secure: false,          // false = STARTTLS on 587 (NOT SSL/465)
-  requireTLS: true,       // force TLS upgrade — reject plain-text fallback
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS  // Must be a Gmail App Password, NOT account password
-  },
-  tls: {
-    rejectUnauthorized: true  // BUG FIX 2: was false — unsafe and causes silent hangs
-  },
-  connectionTimeout: 10000,   // BUG FIX 3: was unset → 120s hang on Render
-  greetingTimeout:  10000,
-  socketTimeout:    15000
-});
 
-// Verify once at startup — surfaces credential/port errors immediately in logs
-// instead of silently failing on first email send.
-transporter.verify((err) => {
-  if (err) {
-    console.error('[SMTP] ❌ Connection failed:', err.message);
-    console.error('[SMTP] Check EMAIL_HOST, EMAIL_PORT, EMAIL_USER, EMAIL_PASS in Render env vars');
-  } else {
-    console.log('[SMTP] ✅ Ready — connected to', process.env.EMAIL_HOST || 'smtp.gmail.com');
-  }
-});
+if (!process.env.RESEND_API_KEY) {
+  console.error('[Resend] ❌ RESEND_API_KEY is missing from environment variables');
+}
 
-// BUG FIX 4: Unified sender across all functions — falls back gracefully if
-// EMAIL_FROM is missing from env (the most common Render misconfiguration).
-const FROM_ADDRESS = {
-  name: 'CivicPulse',
-  address: process.env.EMAIL_FROM || process.env.EMAIL_USER
-};
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+// Resend requires `from` to be either:
+//   - onboarding@resend.dev   (works immediately, no setup — testing only)
+//   - someone@yourverifieddomain.com  (after verifying a domain in dashboard)
+// Set RESEND_FROM_EMAIL in your env once you verify a domain.
+const FROM_ADDRESS = process.env.RESEND_FROM_EMAIL || 'CivicPulse <onboarding@resend.dev>';
 
 /**
  * Send OTP email for verification
@@ -72,15 +50,21 @@ const sendOTPEmail = async (email, otp, purpose) => {
     </html>
   `;
 
-  const info = await transporter.sendMail({
-    from: FROM_ADDRESS,  // BUG FIX 4: was process.env.EMAIL_USER (plain string, no display name)
+  const { data, error } = await resend.emails.send({
+    from: FROM_ADDRESS,
     to: email,
     subject: `Your CivicPulse verification code is ${otp}`,
     text: `Your CivicPulse ${purposeText} code is: ${otp}\n\nThis code expires in 10 minutes.\nDo not share this with anyone.`,
     html
   });
 
-  console.log(`[Email] OTP sent to ${email} — MessageId: ${info.messageId}`);
+  if (error) {
+    console.error('[Resend] OTP send failed:', error);
+    throw new Error(error.message || 'Failed to send OTP email');
+  }
+
+  console.log(`[Email] OTP sent to ${email} — MessageId: ${data.id}`);
+  return data;
 };
 
 /**
@@ -173,18 +157,24 @@ const sendIssueToAuthority = async (issue, authorityEmail) => {
     </html>
   `;
 
-  const info = await transporter.sendMail({
-    from: FROM_ADDRESS,  // BUG FIX 4: was process.env.EMAIL_FROM (unset on Render = crash)
+  // NOTE: Resend's free tier only supports `replyTo`, not arbitrary custom
+  // headers like the old nodemailer 'Message-ID'/'X-Issue-ID'. We fold the
+  // issue ID into the subject (already present) which is sufficient for the
+  // IMAP reply-parsing service to match it via regex on the subject line.
+  const { data, error } = await resend.emails.send({
+    from: FROM_ADDRESS,
     to: authorityEmail,
+    replyTo: process.env.EMAIL_REPLY_TO || undefined, // set if replies should route to your IMAP inbox
     subject: `[CivicPulse] [${issue.issueId}] New Issue: ${issue.title} - ${issue.severity.toUpperCase()} Priority`,
-    html,
-    headers: {
-      'X-Issue-ID': issue.issueId,
-      'Message-ID': `<issue-${issue.issueId}@civicpulse.in>`
-    }
+    html
   });
 
-  return info;
+  if (error) {
+    console.error('[Resend] Authority email failed:', error);
+    throw new Error(error.message || 'Failed to send issue report email');
+  }
+
+  return data;
 };
 
 /**
@@ -234,12 +224,19 @@ const sendStatusUpdateToReporter = async (reporterEmail, issue, update) => {
     </html>
   `;
 
-  await transporter.sendMail({
-    from: FROM_ADDRESS,  // BUG FIX 4
+  const { data, error } = await resend.emails.send({
+    from: FROM_ADDRESS,
     to: reporterEmail,
     subject: `[CivicPulse] Issue ${issue.issueId} Update: ${issue.status.replace(/_/g, ' ').toUpperCase()}`,
     html
   });
+
+  if (error) {
+    console.error('[Resend] Status update email failed:', error);
+    throw new Error(error.message || 'Failed to send status update email');
+  }
+
+  return data;
 };
 
 /**
@@ -276,18 +273,24 @@ const sendBadgeEmail = async (userEmail, userName, badge, certificateBase64) => 
   if (certificateBase64) {
     attachments.push({
       filename: `CivicPulse_Certificate_${badge.name.replace(/\s/g, '_')}.pdf`,
-      content: Buffer.from(certificateBase64, 'base64'),
-      contentType: 'application/pdf'
+      content: certificateBase64 // Resend accepts base64 string directly for `content`
     });
   }
 
-  await transporter.sendMail({
-    from: FROM_ADDRESS,  // BUG FIX 4
+  const { data, error } = await resend.emails.send({
+    from: FROM_ADDRESS,
     to: userEmail,
     subject: `🏆 You earned the "${badge.name}" badge on CivicPulse!`,
     html,
     attachments
   });
+
+  if (error) {
+    console.error('[Resend] Badge email failed:', error);
+    throw new Error(error.message || 'Failed to send badge email');
+  }
+
+  return data;
 };
 
 module.exports = {
