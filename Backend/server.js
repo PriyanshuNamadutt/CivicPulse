@@ -74,26 +74,41 @@ app.get('/api/health', (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────
-// SMTP health check — hit this on Render to confirm email works.
+// Brevo email health check — hit this on Render to confirm email works.
+// GET /api/health/smtp
 // Remove or guard behind admin auth before going to full production.
 // ─────────────────────────────────────────────────────────────────
 app.get('/api/health/smtp', async (req, res) => {
   try {
-    const { Resend } = require('resend');
-    if (!process.env.RESEND_API_KEY) {
-      return res.status(500).json({ success: false, error: 'RESEND_API_KEY not set' });
+    const axios = require('axios');
+
+    if (!process.env.BREVO_API_KEY) {
+      return res.status(500).json({ success: false, error: 'BREVO_API_KEY not set' });
     }
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    const { data, error } = await resend.emails.send({
-      from: process.env.RESEND_FROM_EMAIL || 'CivicPulse <onboarding@resend.dev>',
-      to: process.env.RESEND_TEST_RECIPIENT || process.env.EMAIL_USER,
-      subject: 'CivicPulse Resend health check',
-      html: '<p>✅ Resend is connected and working.</p>'
+    if (!process.env.BREVO_FROM_EMAIL) {
+      return res.status(500).json({ success: false, error: 'BREVO_FROM_EMAIL not set (must be a verified sender in Brevo)' });
+    }
+
+    const recipient = process.env.BREVO_TEST_RECIPIENT || process.env.BREVO_FROM_EMAIL;
+
+    const response = await axios.post('https://api.brevo.com/v3/smtp/email', {
+      sender: { email: process.env.BREVO_FROM_EMAIL, name: process.env.BREVO_FROM_NAME || 'CivicPulse' },
+      to: [{ email: recipient }],
+      subject: 'CivicPulse Brevo health check',
+      htmlContent: '<p>✅ Brevo is connected and working.</p>'
+    }, {
+      headers: {
+        'api-key': process.env.BREVO_API_KEY,
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      },
+      timeout: 15000
     });
-    if (error) return res.status(500).json({ success: false, error: error.message });
-    res.json({ success: true, message: 'Resend connected', id: data.id });
+
+    res.json({ success: true, message: 'Brevo connected', messageId: response.data.messageId });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    const apiError = err.response?.data;
+    res.status(500).json({ success: false, error: apiError?.message || err.message });
   }
 });
 
