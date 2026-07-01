@@ -143,7 +143,7 @@ Newcomer → Observer → Concerned Citizen → Active Resident → Community Me
 - **Axios** — HTTP client
 
 ### External APIs
-- **Google Gemini 1.5 Flash** (AI analysis)
+- **Google Gemini 2.5 Flash** (AI analysis)
 - **Cloudinary** (media CDN)
 - **OpenStreetMap Nominatim** (reverse geocoding, free)
 - **UIDAI Aadhaar API** (verification, production)
